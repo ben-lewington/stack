@@ -1,0 +1,6 @@
+1 if
+    1 dup . .
+end
+0 if
+    1 dup . .
+end

@@ -1,92 +1,105 @@
-use crate::types::{FileMapped, Op, Op1_0, Op2_1, Op2_2, WaError};
+use anyhow::Context;
 
-impl<'a, T: Iterator<Item = FileMapped<'a, char>> + Clone> WaLexer<T> {
-    pub fn parse_ops(mut self) -> crate::Result<Vec<FileMapped<'a, Op>>> {
-        let mut ops = vec![];
-        'tok: loop {
-            match self.advance1() {
-                Some((loc, ch)) if ch.is_digit(10) => loop {
-                    let start_loc = loc;
-                    let (mut n, base) = match self.peek1() {
-                        // 0[x,b]<num in diff base>
-                        Some((loc, radix)) if ch == '0' && (radix == 'x' || radix == 'b') => {
-                            self.advance1();
-                            (
-                                String::from(
-                                    self.advance1()
-                                        .ok_or(WaError::UnexpectedEof {
-                                            parsing_from: start_loc.into(),
-                                            at: loc.into(),
-                                            expected: match radix {
-                                                'x' => "hexadecimal",
-                                                'b' => "binary",
-                                                _ => unreachable!(),
-                                            }
-                                            .to_string(),
-                                        })?
-                                        .1,
-                                ),
-                                match radix {
-                                    'x' => 16,
-                                    'b' => 2,
-                                    _ => unreachable!(),
-                                },
-                            )
-                        }
+use crate::{
+    ops::{Op, Op1_0, Op1_2, Op2_1, Op2_2, OpIdx},
+    tokenise::Span,
+    utils::Chunk,
+};
 
-                        Some((_, ch_1)) if ch_1.is_digit(10) => (String::from(ch), 10),
-                        Some((loc, ch)) => {
-                            return Err(WaError::UnexpectedToken {
-                                parsing_from: start_loc.into(),
-                                at: loc.into(),
-                                expected: "digit".into(),
-                                got: ch.clone(),
-                            }
-                            .splat())
-                        }
-                        None => break 'tok,
-                    };
+pub struct Program {
+    pub ops: Vec<Span<Op>>,
+    pub branches: Vec<Branch>,
+}
 
-                    let mut prev_loc = loc;
-                    'dig: loop {
-                        match self.peek1() {
-                            Some((loc, ch)) if ch.is_digit(base) => {
-                                self.advance1();
-                                n.push(ch);
-                                prev_loc = loc;
-                            }
-                            Some((_, ch)) if ch.is_whitespace() => break 'dig,
-                            Some((t, ch)) => {
-                                return Err(WaError::UnexpectedToken {
-                                    parsing_from: start_loc.into(),
-                                    at: t.into(),
-                                    expected: "digit".into(),
-                                    got: ch.clone(),
-                                }
-                                .splat());
-                            }
-                            None => break 'tok,
-                        }
+pub enum Branch {
+    If {
+        at: Span<OpIdx>,
+        elses: Vec<Span<OpIdx>>,
+        end: Span<OpIdx>,
+    },
+}
+
+pub fn parse_ops(tokens: Vec<Span<&str>>, file_name: impl AsRef<str>) -> anyhow::Result<Program> {
+    let file_name = file_name.as_ref();
+    let mut it = crate::utils::Descend(tokens.into_iter().enumerate());
+    let mut ops = vec![];
+    let branches = vec![];
+    let parse_depth = 0;
+
+    loop {
+        match it.chop_opt::<1>() {
+            Chunk::AllOf([Some((_, Span { idx: tok_id, token }))]) => {
+                println!("{file_name}:{tok_id}: {token}");
+                let at = tok_id.as_stamp(file_name);
+                let op = match token {
+                    s if s.len() > 2 && (&s[0..2] == "0x" || &s[0..2] == "0b") => {
+                        let base = match s.chars().skip(1).next() {
+                            Some('x') => 16,
+                            Some('b') => 2,
+                            _ => unreachable!(),
+                        };
+                        let (_, num) = s.split_at(2);
+                        Op::Push(isize::from_str_radix(num, base).with_context(|| {
+                            format!("{at}: unable to parse \"{s}\" as base-{base} numeric literal",)
+                        })?)
                     }
-                    ops.push((prev_loc, Op::Push(isize::from_str_radix(&n, base)?)));
-                    self.advance1();
-                    continue 'tok;
-                },
-                Some((loc, ch)) if ch == '+' => ops.push((loc, Op::Intrinsic2_1(Op2_1::Add))),
-                Some((loc, ch)) if ch == '-' => ops.push((loc, Op::Intrinsic2_1(Op2_1::Sub))),
-                Some((loc, ch)) if ch == '*' => ops.push((loc, Op::Intrinsic2_1(Op2_1::Mul))),
-                Some((loc, ch)) if ch == '/' => ops.push((loc, Op::Intrinsic2_1(Op2_1::Div))),
-                Some((loc, ch)) if ch == '%' => ops.push((loc, Op::Intrinsic2_1(Op2_1::Mod))),
-                Some((loc, ch)) if ch == '@' => ops.push((loc, Op::Intrinsic2_2(Op2_2::DivMod))),
-                Some((loc, ch)) if ch == '.' => ops.push((loc, Op::Intrinsic1_0(Op1_0::Display))),
-                Some((loc, ch)) if ch == '.' => ops.push((loc, Op::Intrinsic1_0(Op1_0::Display))),
-                Some((_, ch)) if ch.is_whitespace() => {}
-                Some(t) => {
-                    todo!("{t:?}");
-                }
-                None => break,
+                    s if s.len() > 1
+                        && s.chars().next().filter(|&ch| ch == '-').is_some()
+                        && s.chars().skip(1).all(|ch| ch.is_digit(10)) =>
+                    {
+                        Op::Push(-s[1..].parse::<isize>().with_context(|| {
+                            format!("{at}: unable to parse \"{s}\" as negative numeric literal",)
+                        })?)
+                    }
+                    s if s.len() > 0 && s.chars().all(|ch| ch.is_digit(10)) => {
+                        Op::Push(s.parse::<isize>().with_context(|| {
+                            format!("{at}: unable to parse \"{s}\" as numeric literal",)
+                        })?)
+                    }
+                    "." => Op::Intr1_0(Op1_0::Display),
+                    "+" => Op::Intr2_1(Op2_1::Add),
+                    "-" => Op::Intr2_1(Op2_1::Sub),
+                    "*" => Op::Intr2_1(Op2_1::Mul),
+                    "/" => Op::Intr2_1(Op2_1::Div),
+                    "%" => Op::Intr2_1(Op2_1::Mod),
+                    "=" => Op::Intr2_1(Op2_1::Equ),
+                    "<" => Op::Intr2_1(Op2_1::Less),
+                    ">" => Op::Intr2_1(Op2_1::Greater),
+                    "<=" => Op::Intr2_1(Op2_1::LessEqu),
+                    ">=" => Op::Intr2_1(Op2_1::GreaterEqu),
+                    "/%" => Op::Intr2_2(Op2_2::DivMod),
+                    "drop" => Op::Intr1_0(Op1_0::Drop),
+                    "dup" => Op::Intr1_2(Op1_2::Duplicate),
+                    "swap" => Op::Intr2_2(Op2_2::Swap),
+                    "if" => {
+                        let mut t = it.clone();
+                        let end_addr = loop {
+                            match t.chop_opt::<1>() {
+                                Chunk::AllOf([Some((e_id, Span { idx: _, token }))]) => match token
+                                {
+                                    "end" | "else" => break e_id,
+                                    _ => {}
+                                },
+                                Chunk::NoneOf => anyhow::bail!(
+                                    "{at}: Unbalanced IF expression",
+                                    at = tok_id.as_stamp(&file_name)
+                                ),
+                                _ => unreachable!("Chunk::<1, I>::SomeOf??"),
+                            }
+                        };
+                        Op::If(OpIdx::new(end_addr + 1))
+                    }
+                    "end" => Op::End,
+                    t => anyhow::bail!("{at}: unknown token \"{t}\""),
+                };
+                ops.push(Span {
+                    idx: tok_id,
+                    token: op,
+                });
             }
+            Chunk::NoneOf => break,
+            _ => unreachable!(),
         }
-        Ok(ops)
     }
+    Ok(Program { ops, branches })
 }
